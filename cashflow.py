@@ -7,6 +7,9 @@ import calendar
 
 import notion_client as nc
 import manual_store as ms
+import fx
+
+CANALES_CLP = {"Superprof.cl", "Tus Clases"}
 
 MESES_ES = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio",
             "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
@@ -35,6 +38,13 @@ def _period_label(start: date, end: date):
                 return f"📅 Mes actual ({nombre_mes})"
             return f"📅 {nombre_mes} {start.year}"
     return "📅 Fecha Personalizada"
+
+
+def _sort_desc(items):
+    """Ordena una lista de dicts con clave 'fecha' (ISO) de más reciente
+    a más antigua. Sirve solo como orden por defecto -- el usuario puede
+    reordenar haciendo click en los encabezados de las tablas."""
+    return sorted(items, key=lambda x: x.get("fecha") or "", reverse=True)
 
 
 def _short_date(iso_str):
@@ -67,14 +77,49 @@ def render_cashflow(tasa_clp: float):
     except Exception as e:
         ventas, total_level_up, error_level_up = [], 0, str(e)
 
-    # --- Clases particulares (Notion, CLP -> USD) ---
+    # --- Clases particulares (Notion) ---
+    # Superprof.cl / Tus Clases cobran en CLP (se convierte con el tipo de
+    # cambio histórico del día de la clase); Preply / Superprof.com ya
+    # vienen en USD directo.
     try:
         clases = nc.get_clases(start, end)
-        total_clases_clp = sum(c["valor"] for c in clases)
-        total_clases_usd = total_clases_clp / tasa_clp if tasa_clp else 0
+        fx_hist = fx.clp_history(start, end)
+
+        def _clase_usd(c):
+            if c["canal"] in CANALES_CLP:
+                d = date.fromisoformat(c["fecha"][:10]) if c["fecha"] else start
+                rate = fx.rate_on(fx_hist, d, tasa_clp)
+                return c["valor_clp"] / rate if rate else 0
+            return c["valor_usd"] or 0
+
+        for c in clases:
+            c["valor_usd_resuelto"] = _clase_usd(c)
+        total_clases_ingresos = sum(c["valor_usd_resuelto"] for c in clases)
         error_clases = None
     except Exception as e:
-        clases, total_clases_usd, error_clases = [], 0, str(e)
+        clases, total_clases_ingresos, error_clases = [], 0, str(e)
+
+    # --- Gastos Operativos (Notion) -- se restan de los ingresos de Clases ---
+    try:
+        gastos = nc.get_gastos_operativos(start, end)
+
+        def _gasto_usd(g):
+            if g["monto_usd"]:
+                return g["monto_usd"]
+            if g["monto_clp"]:
+                d = date.fromisoformat(g["fecha"][:10]) if g["fecha"] else start
+                rate = fx.rate_on(fx_hist, d, tasa_clp)
+                return g["monto_clp"] / rate if rate else 0
+            return 0
+
+        for g in gastos:
+            g["monto_usd_resuelto"] = _gasto_usd(g)
+        total_gastos = sum(g["monto_usd_resuelto"] for g in gastos)
+        error_gastos = None
+    except Exception as e:
+        gastos, total_gastos, error_gastos = [], 0, str(e)
+
+    total_clases_usd = total_clases_ingresos - total_gastos
 
     # --- Remesas (Notion si existe, si no, manual local) ---
     try:
@@ -102,7 +147,7 @@ def render_cashflow(tasa_clp: float):
             st.caption("⚠️ Notion no disponible")
     with m2:
         st.metric("📚 Clases", f"${total_clases_usd:,.0f}")
-        if error_clases:
+        if error_clases or error_gastos:
             st.caption("⚠️ Notion no disponible")
     with m3:
         st.metric("💱 Remesas", f"${total_remesas:,.0f}")
@@ -176,8 +221,9 @@ def render_cashflow(tasa_clp: float):
                 "Fecha": _short_date(v["fecha"]),
                 "Venta": v["venta"],
                 "Utilidad": f"${v['utilidad']:,.2f}",
-            } for v in ventas])
+            } for v in _sort_desc(ventas)])
             st.dataframe(df, hide_index=True, use_container_width=True)
+            st.caption(f"Total: ${total_level_up:,.2f}")
         else:
             st.caption("Sin ventas en este rango.")
 
@@ -186,13 +232,31 @@ def render_cashflow(tasa_clp: float):
             df = pd.DataFrame([{
                 "Fecha": _short_date(c["fecha"]),
                 "Nombre": c["nombre"],
-                "Valor CLP": f"{c['valor']:,.0f}",
-                "Valor USD": f"${(c['valor'] / tasa_clp if tasa_clp else 0):,.0f}",
                 "Canal": c["canal"],
-            } for c in clases])
+                "Valor": (f"{c['valor_clp']:,.0f} CLP" if c["canal"] in CANALES_CLP
+                          else f"${c['valor_usd']:,.2f}"),
+                "Valor USD": f"${c['valor_usd_resuelto']:,.2f}",
+            } for c in _sort_desc(clases)])
             st.dataframe(df, hide_index=True, use_container_width=True)
+            st.caption(f"Total: ${total_clases_ingresos:,.2f}")
         else:
             st.caption("Sin clases en este rango.")
+
+        st.write("**🧾 Gastos Operativos**")
+        if gastos:
+            df = pd.DataFrame([{
+                "Fecha": _short_date(g["fecha"]),
+                "Item": g["item"],
+                "Monto": (f"${g['monto_usd']:,.2f}" if g["monto_usd"]
+                          else f"{g['monto_clp']:,.0f} CLP"),
+                "Monto USD": f"${g['monto_usd_resuelto']:,.2f}",
+            } for g in _sort_desc(gastos)])
+            st.dataframe(df, hide_index=True, use_container_width=True)
+            st.caption(f"Total: ${total_gastos:,.2f}")
+        else:
+            st.caption("Sin gastos en este rango.")
+
+        st.caption(f"**Utilidad neta Clases (Ingresos − Gastos): ${total_clases_usd:,.2f}**")
 
         st.write("**💱 Cambios y Remesas**")
         if remesas:
@@ -200,7 +264,8 @@ def render_cashflow(tasa_clp: float):
                 "Fecha": _short_date(r["fecha"]),
                 "Nombre": r["nombre"],
                 "Monto": f"${r['monto']:,.2f}",
-            } for r in remesas])
+            } for r in _sort_desc(remesas)])
             st.dataframe(df, hide_index=True, use_container_width=True)
+            st.caption(f"Total: ${total_remesas:,.2f}")
         else:
             st.caption("Sin remesas en este rango.")

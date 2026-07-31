@@ -104,7 +104,11 @@ def get_level_up_ventas(start: date, end: date):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_clases(start: date, end: date):
-    """Clases particulares y asesorías en el rango de fechas."""
+    """Clases particulares y asesorías en el rango de fechas.
+
+    Cada fila trae Valor (CLP) y Valor USD por separado -- son
+    mutuamente excluyentes según el canal: Superprof.cl/Tus Clases
+    cobran en CLP, Preply/Superprof.com en USD."""
     ds_id = st.secrets["CLASES_DS"]
     rows = _query_all(ds_id, _date_range_filter("Fecha", start, end))
     out = []
@@ -113,8 +117,27 @@ def get_clases(start: date, end: date):
         out.append({
             "fecha": _prop_date(p, "Fecha"),
             "nombre": _prop_title(p, "Nombre"),
-            "valor": _prop_number(p, "Valor"),
+            "valor_clp": _prop_number(p, "Valor"),
+            "valor_usd": _prop_number(p, "Valor USD"),
             "canal": _prop_select(p, "Canal"),
+        })
+    return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_gastos_operativos(start: date, end: date):
+    """Gastos operativos asociados a clases particulares. Monto (CLP) y
+    Monto USD son mutuamente excluyentes según cómo se pagó el gasto."""
+    ds_id = st.secrets["GASTOS_OPERATIVOS_DS"]
+    rows = _query_all(ds_id, _date_range_filter("Fecha", start, end))
+    out = []
+    for r in rows:
+        p = r["properties"]
+        out.append({
+            "fecha": _prop_date(p, "Fecha"),
+            "item": _prop_title(p, "Item"),
+            "monto_clp": _prop_number(p, "Monto"),
+            "monto_usd": _prop_number(p, "Monto USD"),
         })
     return out
 
