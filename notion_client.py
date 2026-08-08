@@ -194,3 +194,55 @@ def add_remesa(fecha: date, nombre: str, monto: float):
     resp.raise_for_status()
     get_remesas.clear()
     return resp.json()
+
+
+_MONEDAS_CONOCIDAS = {"USD": "USD", "USDT": "USD", "COP": "COP", "CLP": "CLP", "BTC": "BTC"}
+
+
+def _parse_moneda(item_title: str):
+    """La moneda va como prefijo del nombre del item (ej. 'CLP BICE').
+    Si no hay prefijo reconocido, se asume USD."""
+    primera_palabra = item_title.strip().split(" ")[0].upper() if item_title.strip() else ""
+    return _MONEDAS_CONOCIDAS.get(primera_palabra, "USD")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_balance_items():
+    """Ítems del Estado de Situación (Balance General) desde Notion.
+    Categoría: Activo/Pasivo. Liquidez: Corriente/No Corriente (activos)
+    o Circulante/No Circulante (pasivos). La moneda se infiere del
+    prefijo del nombre del item (USD si no hay prefijo reconocido)."""
+    ds_id = st.secrets["BALANCE_GENERAL_DS"]
+    rows = _query_all(ds_id)
+    out = []
+    for r in rows:
+        p = r["properties"]
+        item = _prop_title(p, "Item")
+        out.append({
+            "item": item,
+            "categoria": _prop_select(p, "Categoría"),
+            "liquidez": _prop_select(p, "Liquidez"),
+            "monto": _prop_number(p, "Monto"),
+            "moneda": _parse_moneda(item),
+        })
+    return out
+
+
+def add_balance_item(item: str, categoria: str, liquidez: str, monto: float):
+    """Crea un nuevo ítem en la base de Balance General de Notion.
+    El nombre del item debe empezar con el prefijo de moneda (USD/COP/
+    CLP/BTC) si no es USD, ej. 'CLP Cuenta Ahorro'."""
+    ds_id = st.secrets["BALANCE_GENERAL_DS"]
+    payload = {
+        "parent": {"type": "data_source_id", "data_source_id": ds_id},
+        "properties": {
+            "Item": {"title": [{"text": {"content": item}}]},
+            "Categoría": {"select": {"name": categoria}},
+            "Liquidez": {"select": {"name": liquidez}},
+            "Monto": {"number": monto},
+        },
+    }
+    resp = requests.post(f"{BASE_URL}/pages", headers=_headers(), json=payload, timeout=15)
+    resp.raise_for_status()
+    get_balance_items.clear()
+    return resp.json()

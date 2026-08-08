@@ -1,10 +1,17 @@
 """Pestaña Estado de Situación (Balance General).
 
-Resumen (tarjetas + totales) arriba; el detalle editable de cada
-categoría vive dentro de su expander "Ver detalle" respectivo.
+Los ítems viven en Notion (base 'Balance General': Item | Categoría |
+Liquidez | Monto). La moneda de cada ítem se infiere del prefijo de su
+nombre (USD/COP/CLP/BTC, default USD si no hay prefijo reconocido).
+Editar montos o agregar/quitar ítems se hace en Notion -- la app solo
+lee y calcula, salvo el formulario rápido de "agregar ítem" que sí
+escribe de vuelta a Notion.
 """
 import streamlit as st
+import pandas as pd
 import notion_client as nc
+
+LIQUIDEZ_OPCIONES = ["Corriente", "No Corriente", "Circulante", "No Circulante"]
 
 
 def _card_html(label, value, color="#00d4ff", big=False):
@@ -29,11 +36,70 @@ def _card_html(label, value, color="#00d4ff", big=False):
     """
 
 
+def _convertir_usd(monto, moneda, tasa_cop, tasa_clp, precio_btc):
+    if moneda == "COP":
+        return monto / tasa_cop if tasa_cop else 0
+    if moneda == "CLP":
+        return monto / tasa_clp if tasa_clp else 0
+    if moneda == "BTC":
+        return monto * precio_btc
+    return monto  # USD (incluye USDT)
+
+
+def _detalle_df(items):
+    return pd.DataFrame([{
+        "Item": it["item"],
+        "Monto": (f"{it['monto']:,.8f} BTC" if it["moneda"] == "BTC"
+                  else f"{it['monto']:,.0f} {it['moneda']}"),
+        "Monto USD": f"${it['monto_usd']:,.2f}",
+    } for it in items])
+
+
 def render_balance(tasa_cop: float, tasa_clp: float, precio_btc: float):
     st.subheader("🏦 Estado de Situación")
 
     BLUE = "#00d4ff"
     ORANGE = "#ffa500"
+
+    try:
+        items = nc.get_balance_items()
+        for it in items:
+            it["monto_usd"] = _convertir_usd(it["monto"], it["moneda"], tasa_cop, tasa_clp, precio_btc)
+        error = None
+    except Exception as e:
+        items, error = [], str(e)
+
+    if error:
+        st.error(f"No se pudo leer la base de Balance General en Notion: {error}")
+        return
+
+    def _bucket(categoria, liquidez):
+        return [it for it in items if it["categoria"] == categoria and it["liquidez"] == liquidez]
+
+    act_corr_items = _bucket("Activo", "Corriente")
+    act_no_corr_items = _bucket("Activo", "No Corriente")
+    pas_circ_items = _bucket("Pasivo", "Circulante")
+    pas_no_circ_items = _bucket("Pasivo", "No Circulante")
+
+    # Level Up (inventario aún no vendido) se calcula en vivo desde Notion,
+    # no vive en la base de Balance General -- se agrega como ítem sintético.
+    try:
+        level_up = nc.get_level_up_inventario_activo()
+        act_no_corr_items = act_no_corr_items + [{
+            "item": "🎮 Level Up (auto)",
+            "categoria": "Activo",
+            "liquidez": "No Corriente",
+            "monto": level_up,
+            "moneda": "USD",
+            "monto_usd": level_up,
+        }]
+    except Exception:
+        pass
+
+    act_corr = sum(it["monto_usd"] for it in act_corr_items)
+    act_no_corr = sum(it["monto_usd"] for it in act_no_corr_items)
+    pas_circ = sum(it["monto_usd"] for it in pas_circ_items)
+    pas_no_circ = sum(it["monto_usd"] for it in pas_no_circ_items)
 
     # --- Placeholders para las cajas anchas de Total Activos / Total Pasivos ---
     ra1, ra2 = st.columns(2)
@@ -44,66 +110,37 @@ def render_balance(tasa_cop: float, tasa_clp: float, precio_btc: float):
 
     cb1, cb2, cb3, cb4 = st.columns(4)
 
-    # --- Activos Corrientes ---
     with cb1:
-        ph_corr = st.empty()
+        st.markdown(_card_html("🔹 Corrientes", act_corr, BLUE), unsafe_allow_html=True)
         with st.expander("Ver detalle"):
-            usd_efectivo = st.number_input("USD Efectivo 💵", value=0.0)
-            usdt_binance = st.number_input("USDT Binance 🏦", value=1625.0)
-            usd_zinli = st.number_input("USD Zinli 🇵🇦", value=10.0)
-            usd_paypal = st.number_input("USD Paypal 🇺🇸", value=206.5)
-            usd_bdv = st.number_input("USD BDV 🇻🇪", value=20.0)
-            cop_efectivo = st.number_input("COP Efectivo 🇨🇴", value=0.0)
-            st.caption(f"→ ${(cop_efectivo / tasa_cop if tasa_cop else 0):,.0f}")
-            clp_bice = st.number_input("CLP BICE 🇨🇱", value=43986.0)
-            st.caption(f"→ ${(clp_bice / tasa_clp if tasa_clp else 0):,.0f}")
-            clp_mp = st.number_input("CLP MercadoPago 🇨🇱", value=1689443.0)
-            st.caption(f"→ ${(clp_mp / tasa_clp if tasa_clp else 0):,.0f}")
+            if act_corr_items:
+                st.dataframe(_detalle_df(act_corr_items), hide_index=True, use_container_width=True)
+            else:
+                st.caption("Sin ítems.")
 
-        act_corr = (usd_efectivo + usdt_binance + usd_zinli + usd_paypal + usd_bdv +
-                    (cop_efectivo / tasa_cop if tasa_cop else 0) +
-                    (clp_bice / tasa_clp if tasa_clp else 0) +
-                    (clp_mp / tasa_clp if tasa_clp else 0))
-        ph_corr.markdown(_card_html("🔹 Corrientes", act_corr, BLUE), unsafe_allow_html=True)
-
-    # --- Activos No Corrientes ---
     with cb2:
-        ph_no_corr = st.empty()
+        st.markdown(_card_html("🔹 No Corrientes", act_no_corr, BLUE), unsafe_allow_html=True)
         with st.expander("Ver detalle"):
-            try:
-                level_up = nc.get_level_up_inventario_activo()
-                level_up_auto = True
-            except Exception:
-                level_up = st.number_input("🎮 Level Up (manual, Notion no disponible)", value=1936.0)
-                level_up_auto = False
-            if level_up_auto:
-                st.write(f"🎮 Level Up (auto): ${level_up:,.0f}")
-            btc_inv = st.number_input("₿ Bitcoin", value=0.004125217, format="%.9f")
-            st.caption(f"→ ${(btc_inv * precio_btc):,.0f}")
-            karla = st.number_input("Karla Switch CxC (CLP)", value=200000.0)
-            st.caption(f"→ ${(karla / tasa_clp if tasa_clp else 0):,.0f}")
+            if act_no_corr_items:
+                st.dataframe(_detalle_df(act_no_corr_items), hide_index=True, use_container_width=True)
+            else:
+                st.caption("Sin ítems.")
 
-        act_no_corr = (level_up + btc_inv * precio_btc + (karla / tasa_clp if tasa_clp else 0))
-        ph_no_corr.markdown(_card_html("🔹 No Corrientes", act_no_corr, BLUE), unsafe_allow_html=True)
-
-    # --- Pasivos Circulantes ---
     with cb3:
-        ph_circ = st.empty()
+        st.markdown(_card_html("🔸 Circulantes", pas_circ, ORANGE), unsafe_allow_html=True)
         with st.expander("Ver detalle"):
-            pasivo_alex = st.number_input("Alexandra García", value=2510.0)
+            if pas_circ_items:
+                st.dataframe(_detalle_df(pas_circ_items), hide_index=True, use_container_width=True)
+            else:
+                st.caption("Sin ítems.")
 
-        pas_circ = pasivo_alex
-        ph_circ.markdown(_card_html("🔸 Circulantes", pas_circ, ORANGE), unsafe_allow_html=True)
-
-    # --- Pasivos No Circulantes ---
     with cb4:
-        ph_no_circ = st.empty()
+        st.markdown(_card_html("🔸 No Circulantes", pas_no_circ, ORANGE), unsafe_allow_html=True)
         with st.expander("Ver detalle"):
-            pasivo_carlos = st.number_input("Carlos Verdugo (CLP)", value=1722552.0)
-            st.caption(f"→ ${(pasivo_carlos / tasa_clp if tasa_clp else 0):,.0f}")
-
-        pas_no_circ = (pasivo_carlos / tasa_clp if tasa_clp else 0)
-        ph_no_circ.markdown(_card_html("🔸 No Circulantes", pas_no_circ, ORANGE), unsafe_allow_html=True)
+            if pas_no_circ_items:
+                st.dataframe(_detalle_df(pas_no_circ_items), hide_index=True, use_container_width=True)
+            else:
+                st.caption("Sin ítems.")
 
     # --- Totales (llenan los placeholders de arriba) ---
     total_activos = act_corr + act_no_corr
@@ -131,3 +168,21 @@ def render_balance(tasa_cop: float, tasa_clp: float, precio_btc: float):
             </div>
         </div>
     """, unsafe_allow_html=True)
+
+    # --- Agregar nuevo ítem (escribe directo a Notion) ---
+    with st.expander("➕ Agregar ítem al Balance General"):
+        st.caption("El prefijo del nombre define la moneda: USD, COP, CLP o BTC. Sin prefijo = USD.")
+        with st.form("form_balance_item", clear_on_submit=True):
+            fc1, fc2 = st.columns(2)
+            f_item = fc1.text_input("Item (ej: CLP Cuenta Ahorro)")
+            f_monto = fc2.number_input("Monto", value=0.0, step=1.0, format="%.8f")
+            fc3, fc4 = st.columns(2)
+            f_categoria = fc3.selectbox("Categoría", ["Activo", "Pasivo"])
+            f_liquidez = fc4.selectbox("Liquidez", LIQUIDEZ_OPCIONES)
+            if st.form_submit_button("Guardar en Notion"):
+                if f_item.strip():
+                    nc.add_balance_item(f_item.strip(), f_categoria, f_liquidez, f_monto)
+                    st.success("Ítem guardado en Notion.")
+                    st.rerun()
+                else:
+                    st.error("El nombre del ítem no puede estar vacío.")
