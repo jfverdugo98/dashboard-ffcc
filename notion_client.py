@@ -75,6 +75,11 @@ def _prop_select(props, name):
     return sel["name"] if sel else None
 
 
+def _prop_relation_ids(props, name):
+    rel = props.get(name, {}).get("relation", [])
+    return [r["id"] for r in rel]
+
+
 def _date_range_filter(date_property, start: date, end: date):
     return {
         "and": [
@@ -84,20 +89,56 @@ def _date_range_filter(date_property, start: date, end: date):
     }
 
 
+def _get_item_costs(item_ids):
+    """Costo total real de cada ítem de inventario, leído directo de la
+    página del ítem (no vía el rollup 'Costo Inventario' de la venta,
+    que puede quedar desactualizado en Notion tras editar el ítem --
+    es un rollup de 3 niveles y la API a veces devuelve el valor stale)."""
+    costs = {}
+    for item_id in item_ids:
+        resp = requests.get(f"{BASE_URL}/pages/{item_id}", headers=_headers(), timeout=15)
+        resp.raise_for_status()
+        costs[item_id] = _prop_number(resp.json()["properties"], "Costo total")
+    return costs
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_level_up_ventas(start: date, end: date):
-    """Ventas de Level Up en el rango de fechas. Retorna lista de dicts."""
+    """Ventas de Level Up en el rango de fechas. Retorna lista de dicts.
+
+    La Utilidad se recalcula aquí (precio_venta - comision - costo real
+    de los artículos vinculados) en vez de leer el campo 'Utilidad' de
+    Notion, que depende de un rollup de fórmulas anidadas propenso a
+    quedar desactualizado."""
     ds_id = st.secrets["LEVEL_UP_VENTAS_DS"]
     rows = _query_all(ds_id, _date_range_filter("Fecha de venta", start, end))
-    out = []
+
+    parsed = []
+    all_item_ids = set()
     for r in rows:
         p = r["properties"]
-        out.append({
+        item_ids = _prop_relation_ids(p, "Inventario (Artículos)")
+        all_item_ids.update(item_ids)
+        parsed.append({
             "fecha": _prop_date(p, "Fecha de venta"),
             "venta": _prop_title(p, "Venta"),
             "precio_venta": _prop_number(p, "Precio venta"),
             "comision": _prop_number(p, "Comision"),
-            "utilidad": _prop_number(p, "Utilidad "),
+            "item_ids": item_ids,
+        })
+
+    costos = _get_item_costs(all_item_ids)
+
+    out = []
+    for row in parsed:
+        costo_inventario = sum(costos.get(i, 0) for i in row["item_ids"])
+        out.append({
+            "fecha": row["fecha"],
+            "venta": row["venta"],
+            "precio_venta": row["precio_venta"],
+            "comision": row["comision"],
+            "costo_inventario": costo_inventario,
+            "utilidad": row["precio_venta"] - row["comision"] - costo_inventario,
         })
     return out
 
