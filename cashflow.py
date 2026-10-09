@@ -2,12 +2,13 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import calendar
 
 import notion_client as nc
 import manual_store as ms
 import fx
+from cards import card_button
 
 CANALES_CLP = {"Superprof.cl", "Tus Clases"}
 
@@ -55,19 +56,36 @@ def _short_date(iso_str):
 
 
 def render_cashflow(tasa_clp: float):
-    st.subheader("💰 Flujo de Caja")
+    titulo_ph = st.empty()
 
     today = date.today()
-    default_start, default_end = _month_bounds(today)
-    c1, c2 = st.columns(2)
-    start = c1.date_input("Desde", value=default_start, key="cf_start")
-    end = c2.date_input("Hasta", value=default_end, key="cf_end")
+    opciones = ["Este mes", "Mes anterior", "Este año", "Rango personalizado"]
+    periodo = st.radio("Período", opciones, index=0, horizontal=True,
+                       key="cf_periodo", label_visibility="collapsed")
+
+    if periodo == "Este mes":
+        start, end = _month_bounds(today)
+    elif periodo == "Mes anterior":
+        start, end = _month_bounds(date(today.year, today.month, 1) - timedelta(days=1))
+    elif periodo == "Este año":
+        start, end = date(today.year, 1, 1), today
+    else:
+        c1, c2 = st.columns(2)
+        d0, d1 = _month_bounds(today)
+        start = c1.date_input("Desde", value=d0, key="cf_start")
+        end = c2.date_input("Hasta", value=d1, key="cf_end")
+
+    if periodo in ("Este mes", "Mes anterior"):
+        sufijo = f" ({MESES_ES[start.month]}" + (f" {start.year})" if start.year != today.year else ")")
+    elif periodo == "Este año":
+        sufijo = f" {start.year}"
+    else:
+        sufijo = f" ({start:%d/%m/%Y} – {end:%d/%m/%Y})"
+    titulo_ph.subheader(f"💰 Flujo de Caja{sufijo}")
 
     if start > end:
         st.error("El rango de fechas es inválido (Desde > Hasta).")
         return
-
-    st.caption(_period_label(start, end))
 
     # --- Level Up (Notion, USD) -- usa Utilidad, no Precio venta ---
     try:
@@ -140,19 +158,82 @@ def render_cashflow(tasa_clp: float):
 
     total_general = total_level_up + total_clases_usd + total_remesas + total_otros
 
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.metric("🎮 Level Up", f"${total_level_up:,.0f}")
-        if error_level_up:
-            st.caption("⚠️ Notion no disponible")
-    with m2:
-        st.metric("📚 Clases", f"${total_clases_usd:,.0f}")
-        if error_clases or error_gastos:
-            st.caption("⚠️ Notion no disponible")
-    with m3:
-        st.metric("💱 Remesas", f"${total_remesas:,.0f}")
-    with m4:
-        st.metric("🧾 Otros", f"${total_otros:,.0f}")
+    abierto = st.session_state.get("cf_detalle")
+    cajas = [
+        ("levelup", "🎮 Level Up", total_level_up, error_level_up),
+        ("clases", "📚 Clases", total_clases_usd, error_clases or error_gastos),
+        ("remesas", "💱 Remesas", total_remesas, None),
+        ("otros", "🧾 Otros", total_otros, None),
+    ]
+    for col, (clave, label, total, err) in zip(st.columns(4), cajas):
+        with col:
+            if card_button(label, total, key=f"cf_{clave}", selected=(abierto == clave)):
+                st.session_state["cf_detalle"] = None if abierto == clave else clave
+                st.rerun()
+            if err:
+                st.caption("⚠️ Notion no disponible")
+
+    # Detalle de la caja seleccionada (a todo el ancho del panel)
+    if abierto == "levelup":
+        st.markdown("**Detalle: 🎮 Level Up**")
+        if ventas:
+            st.dataframe(pd.DataFrame([{
+                "Fecha": _short_date(v["fecha"]),
+                "Venta": v["venta"],
+                "Utilidad": f"${v['utilidad']:,.2f}",
+            } for v in _sort_desc(ventas)]), hide_index=True, use_container_width=True)
+            st.caption(f"Total: ${total_level_up:,.2f}")
+        else:
+            st.caption("Sin ventas en este rango.")
+    elif abierto == "clases":
+        st.markdown("**Detalle: 📚 Clases Particulares**")
+        if clases:
+            st.dataframe(pd.DataFrame([{
+                "Fecha": _short_date(c["fecha"]),
+                "Nombre": c["nombre"],
+                "Canal": c["canal"],
+                "Valor": (f"{c['valor_clp']:,.0f} CLP" if c["canal"] in CANALES_CLP
+                          else f"${c['valor_usd']:,.2f}"),
+                "Valor USD": f"${c['valor_usd_resuelto']:,.2f}",
+            } for c in _sort_desc(clases)]), hide_index=True, use_container_width=True)
+            st.caption(f"Total ingresos: ${total_clases_ingresos:,.2f}")
+        else:
+            st.caption("Sin clases en este rango.")
+        st.markdown("**🧾 Gastos Operativos**")
+        if gastos:
+            st.dataframe(pd.DataFrame([{
+                "Fecha": _short_date(g["fecha"]),
+                "Item": g["item"],
+                "Monto": (f"${g['monto_usd']:,.2f}" if g["monto_usd"]
+                          else f"{g['monto_clp']:,.0f} CLP"),
+                "Monto USD": f"${g['monto_usd_resuelto']:,.2f}",
+            } for g in _sort_desc(gastos)]), hide_index=True, use_container_width=True)
+            st.caption(f"Total gastos: ${total_gastos:,.2f}")
+        else:
+            st.caption("Sin gastos en este rango.")
+        st.caption(f"**Utilidad neta Clases (Ingresos − Gastos): ${total_clases_usd:,.2f}**")
+    elif abierto == "remesas":
+        st.markdown("**Detalle: 💱 Cambios y Remesas**")
+        if remesas:
+            st.dataframe(pd.DataFrame([{
+                "Fecha": _short_date(r["fecha"]),
+                "Nombre": r["nombre"],
+                "Monto": f"${r['monto']:,.2f}",
+            } for r in _sort_desc(remesas)]), hide_index=True, use_container_width=True)
+            st.caption(f"Total: ${total_remesas:,.2f}")
+        else:
+            st.caption("Sin remesas en este rango.")
+    elif abierto == "otros":
+        st.markdown("**Detalle: 🧾 Otros**")
+        if otros:
+            st.dataframe(pd.DataFrame([{
+                "Fecha": _short_date(o["fecha"]),
+                "Nota": o.get("nota", ""),
+                "Monto": f"${o['monto']:,.2f}",
+            } for o in _sort_desc(otros)]), hide_index=True, use_container_width=True)
+            st.caption(f"Total: ${total_otros:,.2f}")
+        else:
+            st.caption("Sin entradas en este rango.")
 
     st.markdown("---")
     st.metric("Total Flujo de Caja", f"${total_general:,.0f}")
@@ -213,59 +294,3 @@ def render_cashflow(tasa_clp: float):
                     ms.add_entry("remesas", f_fecha, f_monto, "USD", f_nota)
                     st.success("Entrada guardada.")
                     st.rerun()
-
-    with st.expander("📋 Detalle de transacciones del período"):
-        st.write("**🎮 Level Up**")
-        if ventas:
-            df = pd.DataFrame([{
-                "Fecha": _short_date(v["fecha"]),
-                "Venta": v["venta"],
-                "Utilidad": f"${v['utilidad']:,.2f}",
-            } for v in _sort_desc(ventas)])
-            st.dataframe(df, hide_index=True, use_container_width=True)
-            st.caption(f"Total: ${total_level_up:,.2f}")
-        else:
-            st.caption("Sin ventas en este rango.")
-
-        st.write("**📚 Clases Particulares**")
-        if clases:
-            df = pd.DataFrame([{
-                "Fecha": _short_date(c["fecha"]),
-                "Nombre": c["nombre"],
-                "Canal": c["canal"],
-                "Valor": (f"{c['valor_clp']:,.0f} CLP" if c["canal"] in CANALES_CLP
-                          else f"${c['valor_usd']:,.2f}"),
-                "Valor USD": f"${c['valor_usd_resuelto']:,.2f}",
-            } for c in _sort_desc(clases)])
-            st.dataframe(df, hide_index=True, use_container_width=True)
-            st.caption(f"Total: ${total_clases_ingresos:,.2f}")
-        else:
-            st.caption("Sin clases en este rango.")
-
-        st.write("**🧾 Gastos Operativos**")
-        if gastos:
-            df = pd.DataFrame([{
-                "Fecha": _short_date(g["fecha"]),
-                "Item": g["item"],
-                "Monto": (f"${g['monto_usd']:,.2f}" if g["monto_usd"]
-                          else f"{g['monto_clp']:,.0f} CLP"),
-                "Monto USD": f"${g['monto_usd_resuelto']:,.2f}",
-            } for g in _sort_desc(gastos)])
-            st.dataframe(df, hide_index=True, use_container_width=True)
-            st.caption(f"Total: ${total_gastos:,.2f}")
-        else:
-            st.caption("Sin gastos en este rango.")
-
-        st.caption(f"**Utilidad neta Clases (Ingresos − Gastos): ${total_clases_usd:,.2f}**")
-
-        st.write("**💱 Cambios y Remesas**")
-        if remesas:
-            df = pd.DataFrame([{
-                "Fecha": _short_date(r["fecha"]),
-                "Nombre": r["nombre"],
-                "Monto": f"${r['monto']:,.2f}",
-            } for r in _sort_desc(remesas)])
-            st.dataframe(df, hide_index=True, use_container_width=True)
-            st.caption(f"Total: ${total_remesas:,.2f}")
-        else:
-            st.caption("Sin remesas en este rango.")

@@ -3,6 +3,7 @@ import streamlit as st
 import fx
 from cashflow import render_cashflow
 from balance import render_balance
+from cards import CARDS_CSS
 
 st.set_page_config(page_title="Dashboard Financiero", layout="wide", page_icon="⚡")
 
@@ -57,7 +58,14 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("⚡ Dashboard Financiero")
+st.markdown(CARDS_CSS, unsafe_allow_html=True)
+
+col_titulo, col_refresh = st.columns([5, 1])
+col_titulo.title("⚡ Dashboard Financiero")
+col_refresh.write("")
+if col_refresh.button("🔄 Actualizar", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
 
 # ---------- Tasas en tiempo real (compartidas por ambas columnas) ----------
 tasa_cop_auto, tasa_clp_auto, precio_btc_auto = fx.tickers()

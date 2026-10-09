@@ -10,6 +10,7 @@ escribe de vuelta a Notion.
 import streamlit as st
 import pandas as pd
 import notion_client as nc
+from cards import card_button
 
 LIQUIDEZ_OPCIONES = ["Corriente", "No Corriente", "Circulante", "No Circulante"]
 
@@ -81,21 +82,6 @@ def render_balance(tasa_cop: float, tasa_clp: float, precio_btc: float):
     pas_circ_items = _bucket("Pasivo", "Circulante")
     pas_no_circ_items = _bucket("Pasivo", "No Circulante")
 
-    # Level Up (inventario aún no vendido) se calcula en vivo desde Notion,
-    # no vive en la base de Balance General -- se agrega como ítem sintético.
-    try:
-        level_up = nc.get_level_up_inventario_activo()
-        act_no_corr_items = act_no_corr_items + [{
-            "item": "🎮 Level Up (auto)",
-            "categoria": "Activo",
-            "liquidez": "No Corriente",
-            "monto": level_up,
-            "moneda": "USD",
-            "monto_usd": level_up,
-        }]
-    except Exception:
-        pass
-
     act_corr = sum(it["monto_usd"] for it in act_corr_items)
     act_no_corr = sum(it["monto_usd"] for it in act_no_corr_items)
     pas_circ = sum(it["monto_usd"] for it in pas_circ_items)
@@ -110,37 +96,31 @@ def render_balance(tasa_cop: float, tasa_clp: float, precio_btc: float):
 
     cb1, cb2, cb3, cb4 = st.columns(4)
 
-    with cb1:
-        st.markdown(_card_html("🔹 Corrientes", act_corr, BLUE), unsafe_allow_html=True)
-        with st.expander("Ver detalle"):
-            if act_corr_items:
-                st.dataframe(_detalle_df(act_corr_items), hide_index=True, use_container_width=True)
-            else:
-                st.caption("Sin ítems.")
+    buckets = [
+        (cb1, "🔹 Corrientes", act_corr, BLUE, act_corr_items),
+        (cb2, "🔹 No Corrientes", act_no_corr, BLUE, act_no_corr_items),
+        (cb3, "🔸 Circulantes", pas_circ, ORANGE, pas_circ_items),
+        (cb4, "🔸 No Circulantes", pas_no_circ, ORANGE, pas_no_circ_items),
+    ]
+    abierto = st.session_state.get("balance_detalle")
+    for i, (col, label, total, color, _) in enumerate(buckets):
+        with col:
+            if card_button(label, total, key=f"bal{i}",
+                           color="blue" if color == BLUE else "orange",
+                           selected=(abierto == i)):
+                st.session_state["balance_detalle"] = None if abierto == i else i
+                st.rerun()
 
-    with cb2:
-        st.markdown(_card_html("🔹 No Corrientes", act_no_corr, BLUE), unsafe_allow_html=True)
-        with st.expander("Ver detalle"):
-            if act_no_corr_items:
-                st.dataframe(_detalle_df(act_no_corr_items), hide_index=True, use_container_width=True)
-            else:
-                st.caption("Sin ítems.")
-
-    with cb3:
-        st.markdown(_card_html("🔸 Circulantes", pas_circ, ORANGE), unsafe_allow_html=True)
-        with st.expander("Ver detalle"):
-            if pas_circ_items:
-                st.dataframe(_detalle_df(pas_circ_items), hide_index=True, use_container_width=True)
-            else:
-                st.caption("Sin ítems.")
-
-    with cb4:
-        st.markdown(_card_html("🔸 No Circulantes", pas_no_circ, ORANGE), unsafe_allow_html=True)
-        with st.expander("Ver detalle"):
-            if pas_no_circ_items:
-                st.dataframe(_detalle_df(pas_no_circ_items), hide_index=True, use_container_width=True)
-            else:
-                st.caption("Sin ítems.")
+    # Detalle a todo el ancho del panel (no dentro de la columna angosta)
+    if abierto is not None:
+        det_titulo = ["🔹 Activos Corrientes", "🔹 Activos No Corrientes",
+                      "🔸 Pasivos Circulantes", "🔸 Pasivos No Circulantes"][abierto]
+        det_items = buckets[abierto][4]
+        st.markdown(f"**Detalle: {det_titulo}**")
+        if det_items:
+            st.dataframe(_detalle_df(det_items), hide_index=True, use_container_width=True)
+        else:
+            st.caption("Sin ítems.")
 
     # --- Totales (llenan los placeholders de arriba) ---
     total_activos = act_corr + act_no_corr
